@@ -1,119 +1,170 @@
 package lib
 
 import (
+	"bufio"
 	"errors"
 	"fmt"
+	"io/fs"
+	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"slices"
+	"strings"
 
-	"github.com/radovskyb/watcher"
+	"github.com/fsnotify/fsnotify"
 )
 
 type Montre struct {
-	Args     []string
-	Filename string
-	Pwd      string
-	Child    *exec.Cmd
-	watcher  *watcher.Watcher
-	// to watch files(default .go) that match this pattern
-	AllowList string
-	// to ignore files that match this pattern
-	IgnoreList string
-	// true by default
-	IgnoreHiddenFiles bool
+	args    []string // could be expanded upon in future
+	pwd     string
+	config  Config
+	child   *exec.Cmd
+	watcher *fsnotify.Watcher
+	blocker chan struct{}
 }
 
 func Init() *Montre {
 	montre := &Montre{
-		Args:              os.Args,
-		Filename:          os.Args[1],
-		AllowList:         "/**/*.go",
-		IgnoreHiddenFiles: true,
-		watcher:           watcher.New(),
+		args: os.Args,
+		config: Config{
+			MainFile:  os.Args[1],
+			WatchExts: []string{".go"},
+		},
 	}
 
 	if configFileExist() {
 		populateConfig(montre)
 	}
 
-	_, err := os.Stat(montre.Filename)
+	mainFileInfo, err := os.Stat(montre.config.MainFile)
 	if errors.Is(err, os.ErrNotExist) {
-		panic(ErrMainFileNotFound)
+		log.Fatalln(ErrMainFileNotFound)
+	}
+	if mainFileInfo.IsDir() {
+		log.Fatalln(ErrMainFileIsDir)
 	}
 
 	pwd, err := os.Getwd()
 	if err != nil {
-		panic("error while setting present working directory")
+		log.Fatalln(ErrSettingPWD)
 	}
-	montre.Pwd = pwd
-
-	fmt.Println(YellowColor+"[montre] watching path(s):", montre.AllowList+ResetColor)
-	// fmt.Println(YellowColor + "[montre] watching extension(s): go" + ResetColor)
-	fmt.Println(GreenColor + "[montre] starting `go run main.go`" + ResetColor)
+	montre.pwd = pwd
 
 	return montre
 }
 
 func (m *Montre) StartWatching() {
-	m.watcher.SetMaxEvents(1)
-	m.watcher.FilterOps(
-		watcher.Write,
-		watcher.Rename,
-		watcher.Remove,
-		watcher.Move,
-	)
-	m.watcher.IgnoreHiddenFiles(m.IgnoreHiddenFiles)
-
-	fmt.Printf("%+v\n", m)
-
-	if err := m.watcher.Ignore([]string{m.IgnoreList}...); err != nil {
-		panic("error while watching recursive path")
+	w, err := fsnotify.NewWatcher()
+	if err != nil {
+		log.Fatalln(ErrWatcherSetup)
 	}
-	if err := m.watcher.AddRecursive(m.AllowList); err != nil {
-		panic("error while watching recursive path")
-	}
+	m.watcher = w
 
-	go m.ListeningEvents()
+	defer m.watcher.Close()
 
-	m.Reload()
-}
+	go m.initListenEvents()
+	go m.acceptCommands()
 
-func (m *Montre) Reload() {
-	if m.Child != nil {
-		err := m.Child.Process.Kill()
+	walkErr := filepath.WalkDir(m.pwd, func(path string, file fs.DirEntry, err error) error {
 		if err != nil {
-			panic(ErrRestartingProcess)
+			return nil
 		}
+
+		if file.IsDir() && slices.Contains(m.config.IgnoreDirs, file.Name()) {
+			return filepath.SkipDir
+		}
+
+		if !slices.Contains(m.config.WatchExts, filepath.Ext(path)) {
+			return nil
+		}
+
+		addErr := m.watcher.Add(path)
+		if addErr != nil {
+			return nil
+		}
+
+		return nil
+	})
+
+	if walkErr != nil {
+		log.Fatalln(ErrWalkingFS)
 	}
 
-	cmd := exec.Command("node", m.Filename)
-	// cmd.StderrPipe()
-	// cmd.StdoutPipe()
-	// cmd.Stdin = os.Stdin
-	// cmd.Stderr = os.Stderr
-	// cmd.Stdout = os.Stdout
+	fmt.Println(MONTRE_LOG + YellowLog("watching extension(s): "+strings.Join(m.config.WatchExts, ",")))
+	fmt.Println(MONTRE_LOG + YellowLog("ignoring folder(s): "+strings.Join(m.config.IgnoreDirs, ", ")))
+	fmt.Println(MONTRE_LOG + YellowLog("to restart watcher enter ") + GreenLog("`rs`"))
+	fmt.Println(MONTRE_LOG + YellowLog("to quit watching enter ") + RedLog("`q`"))
+	fmt.Println(MONTRE_LOG + GreenLog("starting `go run main.go`"))
 
-	m.Child = cmd
-
-	if err := m.Child.Start(); err != nil {
-		panic("some error occured: " + err.Error())
-	}
-
-	if err := m.Child.Wait(); err != nil {
-		fmt.Println("process finished with error:", err.Error())
-		return
-	}
+	m.reload()
+	<-m.blocker
 }
 
-func (m *Montre) ListeningEvents() {
+func (m *Montre) reload() {
+	m.quitChildProcess(ErrRestartChildProcess)
+
+	cmd := exec.Command("go", "run", m.config.MainFile)
+	m.child = cmd
+
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	if err := m.child.Start(); err != nil {
+		log.Fatalln(ErrStartChildProcess)
+	}
+
+	// if err := m.child.Wait(); err != nil {
+	// 	fmt.Println(RedLog("err ----> " + err.Error()))
+	// }
+
+	fmt.Println(MONTRE_LOG + GreenLog("waiting for further changes"))
+}
+
+func (m *Montre) initListenEvents() {
 	for {
 		select {
-		case event := <-m.watcher.Event:
-			fmt.Println("event", event)
-		case err := <-m.watcher.Error:
-			fmt.Println(err)
-		case <-m.watcher.Closed:
-			return
+		case err, ok := <-m.watcher.Errors:
+			if !ok {
+				log.Println(RedLog(err.Error()))
+				return
+			}
+		case _, ok := <-m.watcher.Events:
+			// _  is event struct
+			if !ok {
+				return
+			}
+			m.reload()
+			// fmt.Println(event.Op, event.Name)
+		}
+	}
+}
+
+func (m *Montre) acceptCommands() {
+	scanner := bufio.NewScanner(os.Stdin)
+	if scanner.Err() != nil {
+		log.Fatalln(ErrWatcherSetup)
+	}
+
+	for {
+		if scanner.Scan() {
+			cmd := scanner.Text()
+			switch cmd {
+			case "rs":
+				m.reload()
+			case "q":
+				m.quitChildProcess(ErrKillChildProcess)
+				os.Exit(0)
+			}
+		}
+	}
+}
+
+func (m *Montre) quitChildProcess(errStr error) {
+	if m.child != nil {
+		err := m.child.Process.Kill()
+		if err != nil {
+			log.Fatalln(RedLog(errStr.Error() + " " + err.Error()))
 		}
 	}
 }
