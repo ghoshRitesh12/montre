@@ -1,6 +1,0 @@
-{
-  "main": "index.js",
-  "allowList": ".",
-  "ignoreList": "**/node_modules/**",
-  "ignoreHiddenFiles": true
-}
