@@ -1,0 +1,11 @@
+{
+  "mainFile": "main.go",
+  "watchExtensions": [
+    ".go",
+    ".js",
+    ".json"
+  ],
+  "ignoreDirs": [
+    "bin"
+  ]
+}
