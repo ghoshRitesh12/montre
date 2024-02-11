@@ -5,5 +5,6 @@ import (
 )
 
 func main() {
-	lib.Init().StartWatching()
+	montre := lib.Init()
+	montre.StartWatching()
 }
