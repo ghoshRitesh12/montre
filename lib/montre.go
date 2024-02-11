@@ -114,10 +114,6 @@ func (m *Montre) reload() {
 		log.Fatalln(ErrStartChildProcess)
 	}
 
-	// if err := m.child.Wait(); err != nil {
-	// 	fmt.Println(RedLog("err ----> " + err.Error()))
-	// }
-
 	fmt.Println(MONTRE_LOG + GreenLog("waiting for further changes"))
 }
 
@@ -126,7 +122,7 @@ func (m *Montre) initListenEvents() {
 		select {
 		case err, ok := <-m.watcher.Errors:
 			if !ok {
-				log.Println(RedLog(err.Error()))
+				log.Fatalln(RedLog(err.Error()))
 				return
 			}
 		case _, ok := <-m.watcher.Events:
