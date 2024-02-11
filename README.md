@@ -5,7 +5,6 @@
   />
 </p>
 
-
 ## How does nodemon work?
 
 > I have always had this question because I wanted to know how nodemon detects changes made in a file system or a file tree and then restarts the whole node process.
